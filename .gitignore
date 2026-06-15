@@ -5,3 +5,12 @@ kb/
 
 # OpenClaw internal
 .openclaw/
+
+# Agent workspace files (keep local, don't upload)
+BOOTSTRAP.md
+HEARTBEAT.md
+IDENTITY.md
+SOUL.md
+TOOLS.md
+USER.md
+AGENTS.md
