@@ -1,0 +1,1500 @@
+// XHCI high-level operations - controller lifecycle, rings, ports, transfers.
+//
+// Follows SeaBIOS coding style: struct-based register access,
+// unified ring abstraction, batch event processing.
+
+#include "xhci_internal.h"
+#include <stdint.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <poll.h>
+#include <errno.h>
+#include <time.h>
+
+#define XHCI_TIME_RESET      1000   // ms, HC reset timeout
+#define XHCI_TIME_HALT       5000   // ms, stop timeout
+#define XHCI_TIME_EVENT      5000   // ms, event wait timeout
+#define XHCI_TIME_PORT_RESET 1000   // ms, port reset timeout
+
+// Debug level (controlled by XHCI_DEBUG env var)
+int xhci_debug_level = 0;
+
+void
+xhci_debug_init(void)
+{
+    static int done = 0;
+    if (done) return;
+    const char *env = getenv("XHCI_DEBUG");
+    if (env)
+        xhci_debug_level = atoi(env);
+    done = 1;
+}
+
+// Map TRB type number to name
+const char *
+trb_type_name(u32 type)
+{
+    switch (type) {
+    case TR_NORMAL:           return "NORMAL";
+    case TR_SETUP:            return "SETUP";
+    case TR_DATA:             return "DATA";
+    case TR_STATUS:           return "STATUS";
+    case CR_ENABLE_SLOT:      return "ENABLE_SLOT";
+    case CR_DISABLE_SLOT:     return "DISABLE_SLOT";
+    case CR_ADDRESS_DEVICE:   return "ADDRESS_DEVICE";
+    case CR_CONFIGURE_ENDPOINT: return "CONFIGURE_EP";
+    case CR_EVALUATE_CONTEXT: return "EVAL_CONTEXT";
+    case CR_RESET_ENDPOINT:   return "RESET_EP";
+    case CR_STOP_ENDPOINT:    return "STOP_EP";
+    case ER_TRANSFER:         return "XFER_EVENT";
+    case ER_COMMAND_COMPLETE: return "CMD_COMPLETE";
+    case ER_PORT_STATUS_CHANGE: return "PORT_CHANGE";
+    default:                  return "UNKNOWN";
+    }
+}
+
+// Map completion code to name
+static const char *
+cc_name(u32 cc)
+{
+    switch (cc) {
+    case CC_SUCCESS:              return "SUCCESS";
+    case CC_DATA_BUFFER_ERROR:    return "DATA_BUF_ERR";
+    case CC_BABBLE_DETECTED:      return "BABBLE";
+    case CC_USB_TRANSACTION_ERROR: return "USB_TXN_ERR";
+    case CC_TRB_ERROR:            return "TRB_ERR";
+    case CC_STALL_ERROR:          return "STALL";
+    case CC_RESOURCE_ERROR:       return "RESOURCE_ERR";
+    case CC_SLOT_NOT_ENABLED:     return "SLOT_NOT_EN";
+    case CC_EP_NOT_ENABLED:       return "EP_NOT_EN";
+    case CC_SHORT_PACKET:         return "SHORT_PKT";
+    case CC_PARAMETER_ERROR:      return "PARAM_ERR";
+    case CC_CONTEXT_STATE_ERROR:  return "CTX_STATE_ERR";
+    case CC_INCOMPATIBLE_DEVICE:  return "INCOMPATIBLE";
+    case CC_COMMAND_ABORTED:      return "CMD_ABORTED";
+    case CC_STOPPED:              return "STOPPED";
+    default:                      return "UNKNOWN_CC";
+    }
+}
+
+const char *
+cc_name_safe(u32 cc)
+{
+    return cc_name(cc);
+}
+
+/****************************************************************
+ * Helpers
+ ****************************************************************/
+
+static void
+msleep(int ms)
+{
+    struct timespec ts = { .tv_sec = ms / 1000, .tv_nsec = (ms % 1000) * 1000000L };
+    nanosleep(&ts, NULL);
+}
+
+// Wait for a 32-bit register field to match expected value.
+static int
+wait_status(u32 *reg, u32 mask, u32 value, int timeout_ms)
+{
+    int polls = timeout_ms;
+    while (polls-- > 0) {
+        if ((readl(reg) & mask) == value)
+            return 0;
+        msleep(1);
+    }
+    return -1;
+}
+
+// Access a port register by index
+static struct xhci_pr *
+xhci_port_reg(struct usb_xhci_s *xhci, int port)
+{
+    return &xhci->pr[port];
+}
+
+/****************************************************************
+ * Controller lifecycle
+ ****************************************************************/
+
+int
+xhci_halt(void *handle)
+{
+    struct usb_xhci_s *xhci = handle;
+    u32 cmd;
+
+    cmd = readl(&xhci->op->usbcmd);
+    if (!(cmd & XHCI_CMD_RS)) {
+        fprintf(stderr, "xhci: halt: already stopped\n");
+        return 0;
+    }
+
+    writel(&xhci->op->usbcmd, cmd & ~XHCI_CMD_RS);
+    if (wait_status(&xhci->op->usbsts, XHCI_STS_HCH, XHCI_STS_HCH, XHCI_TIME_HALT) != 0) {
+        fprintf(stderr, "xhci_halt: timeout, controller did not halt\n");
+        return -1;
+    }
+    fprintf(stderr, "xhci: halt: controller stopped\n");
+    return 0;
+}
+
+int
+xhci_reset(void *handle)
+{
+    struct usb_xhci_s *xhci = handle;
+
+    /* SeaBIOS pattern: only halt if controller is running.
+     * HCRST works on both running and halted controllers. */
+    u32 cmd = readl(&xhci->op->usbcmd);
+    if (cmd & XHCI_CMD_RS) {
+        cmd &= ~XHCI_CMD_RS;
+        writel(&xhci->op->usbcmd, cmd);
+        if (wait_status(&xhci->op->usbsts, XHCI_STS_HCH, XHCI_STS_HCH, XHCI_TIME_HALT) != 0) {
+            fprintf(stderr, "xhci_reset: timeout halting controller\n");
+            /* proceed with HCRST anyway */
+        }
+    }
+
+    fprintf(stderr, "xhci: reset: asserting HCRST\n");
+    writel(&xhci->op->usbcmd, XHCI_CMD_HCRST);
+
+    if (wait_status(&xhci->op->usbcmd, XHCI_CMD_HCRST, 0, XHCI_TIME_RESET) != 0) {
+        fprintf(stderr, "xhci_reset: timeout waiting for HCRST to clear\n");
+        return -1;
+    }
+
+    if (wait_status(&xhci->op->usbsts, XHCI_STS_CNR, 0, 5000) != 0) {
+        fprintf(stderr, "xhci_reset: timeout waiting for CNR to clear\n");
+        return -1;
+    }
+    fprintf(stderr, "xhci: reset: done (CNR cleared)\n");
+
+    return 0;
+}
+
+void
+xhci_run(void *handle)
+{
+    struct usb_xhci_s *xhci = handle;
+
+    // This controller doesn't support CRCR readback (always returns 0).
+    // Write the full CRCR with RRC=1 and CRCS=1 in one shot.
+    u64 crcr = (xhci->cmds->ring_phys & ~0x3FULL) | (1ULL << 1) | 1; /* RRC=1, CRCS=1 */
+    writel(&xhci->op->crcr_low, (u32)crcr);
+    writel(&xhci->op->crcr_high, (u32)(crcr >> 32));
+    fprintf(stderr, "xhci_run: CRCR = 0x%08x%08x (RRC=1, CRCS=1)\n",
+            (u32)(crcr >> 32), (u32)crcr);
+
+    // Set RS (Run/Stop)
+    u32 cmd = XHCI_CMD_RS;
+    writel(&xhci->op->usbcmd, cmd);
+    fprintf(stderr, "xhci_run: USBCMD = 0x%08x (RS=1)\n", cmd);
+
+    // Check USBSTS immediately after run
+    u32 sts = readl(&xhci->op->usbsts);
+    fprintf(stderr, "xhci_run: USBSTS after = 0x%08x (HCH=%d HSE=%d HCE=%d)\n",
+            sts,
+            !!(sts & XHCI_STS_HCH),
+            !!(sts & XHCI_STS_HSE),
+            !!(sts & XHCI_STS_HCE));
+}
+
+int
+xhci_stop(void *handle)
+{
+    struct usb_xhci_s *xhci = handle;
+
+    u32 cmd = readl(&xhci->op->usbcmd);
+    cmd &= ~XHCI_CMD_RS;
+    writel(&xhci->op->usbcmd, cmd);
+
+    fprintf(stderr, "xhci: stop: usbcmd=0x%08x (RS cleared)\n", cmd);
+
+    if (wait_status(&xhci->op->usbsts, XHCI_STS_HCH, XHCI_STS_HCH, XHCI_TIME_HALT) != 0) {
+        fprintf(stderr, "xhci_stop: timeout, controller not halted\n");
+        return -1;
+    }
+    fprintf(stderr, "xhci: stop: halted\n");
+    return 0;
+}
+
+int
+xhci_is_halted(void *handle)
+{
+    struct usb_xhci_s *xhci = handle;
+    u32 sts = readl(&xhci->op->usbsts);
+    fprintf(stderr, "xhci: is_halted: USBSTS=0x%08x %s\n", sts, (sts & XHCI_STS_HCH) ? "halted" : "running");
+    return !!(sts & XHCI_STS_HCH);
+}
+
+/****************************************************************
+ * Ring Operations (SeaBIOS-style unified ring)
+ ****************************************************************/
+
+// Fill a TRB at the ring's current position
+void
+xhci_trb_fill(struct xhci_ring *ring, void *data, u32 xferlen, u32 flags)
+{
+    struct xhci_trb *dst = &ring->ring[ring->nidx];
+
+    // IDT flag: if set, data is inline in the TRB (for SETUP TRBs)
+    if (flags & TRB_TR_IDT) {
+        memcpy(&dst->ptr_low, data, xferlen);
+    } else {
+        dst->ptr_low = (u32)(u64)data;
+        dst->ptr_high = (u32)((u64)data >> 32);
+    }
+    dst->status = xferlen;
+    dst->control = flags | (ring->cs ? TRB_C : 0);
+}
+
+// Queue a TRB with automatic LINK TRB wrapping (SeaBIOS pattern)
+void
+xhci_trb_queue(struct xhci_ring *ring, void *data, u32 xferlen, u32 flags)
+{
+    // Near end of ring? Insert LINK TRB and wrap
+    if (ring->nidx >= ring->size - 1) {
+        struct xhci_trb *link = &ring->ring[ring->nidx];
+        link->ptr_low = (u32)ring->ring_phys;
+        link->ptr_high = (u32)(ring->ring_phys >> 32);
+        link->status = 0;
+        link->control = (TR_LINK << TRB_TYPE_SHIFT) | TRB_LK_TC | (ring->cs ? TRB_C : 0);
+        ring->nidx = 0;
+        ring->cs ^= 1;
+        fprintf(stderr, "xhci: ring %p: linked to start\n", ring);
+    }
+
+    xhci_trb_fill(ring, data, xferlen, flags);
+    ring->nidx++;
+}
+
+/****************************************************************
+ * Event Processing (SeaBIOS-style batch drain)
+ ****************************************************************/
+
+// Drain ALL pending events from the event ring (SeaBIOS pattern).
+// CMD_COMPLETE events are stored in cmds->evt.
+// Returns 1 if a COMMAND_COMPLETE was found, 0 otherwise.
+static int
+xhci_process_events(struct usb_xhci_s *xhci)
+{
+    struct xhci_ring *evts = xhci->evts;
+    int found_cmd_complete = 0;
+
+    for (;;) {
+        int nidx = evts->nidx;
+        int expected_cs = evts->cs ? 1 : 0;
+        struct xhci_trb *etrb = &evts->ring[nidx];
+        u32 control = etrb->control;
+
+        if ((control & TRB_C) != (expected_cs ? TRB_C : 0))
+            return found_cmd_complete;  // no more events
+
+        // Process event
+        u32 evt_type = (control >> TRB_TYPE_SHIFT) & TRB_TYPE_MASK;
+        u32 evt_cc = (etrb->status >> 24) & 0xff;
+
+        switch (evt_type) {
+        case ER_COMMAND_COMPLETE:
+        {
+            // SeaBIOS: store command completion to cmds->evt
+            memcpy(&xhci->cmds->evt, etrb, sizeof(*etrb));
+            xhci->cmds->eidx = nidx + 1;
+            if (xhci->cmds->eidx >= evts->size) {
+                xhci->cmds->eidx = 0;
+            }
+            fprintf(stderr, "xhci: evt: type=%s cc=%s param=0x%08x%08x slot=%d\n",
+                    trb_type_name(evt_type), cc_name_safe(evt_cc),
+                    etrb->ptr_high, etrb->ptr_low,
+                    (control >> TRB_CR_SLOTID_SHIFT) & 0xff);
+
+            // Advance event ring and update ERDP before returning
+            evts->nidx = xhci->cmds->eidx;
+            if (evts->nidx >= evts->size) {
+                evts->nidx = 0;
+                evts->cs ^= 1;
+            }
+            u64 erdp = evts->ring_phys + (u64)evts->nidx * XHCI_TRB_SIZE;
+            writel(&xhci->ir->erdp_low, (u32)erdp);
+            writel(&xhci->ir->erdp_high, (u32)(erdp >> 32));
+            fprintf(stderr, "  ERDP updated to 0x%llx (nidx=%d, cs=%d)\n",
+                    (unsigned long long)erdp, evts->nidx, evts->cs);
+            return 1;
+        }
+        case ER_TRANSFER:
+        {
+            // Transfer event — find the ring from TRB pointer
+            memcpy(&evts->evt, etrb, sizeof(*etrb));
+            evts->eidx = nidx + 1;
+            if (evts->eidx >= evts->size) {
+                evts->eidx = 0;
+                evts->cs ^= 1;
+            }
+            fprintf(stderr, "xhci: evt: transfer cc=%s param=0x%08x%08x\n",
+                    cc_name_safe(evt_cc), etrb->ptr_high, etrb->ptr_low);
+
+            // Advance event ring and update ERDP
+            evts->nidx = evts->eidx;
+            if (evts->nidx >= evts->size) {
+                evts->nidx = 0;
+                evts->cs ^= 1;
+            }
+            u64 erdp = evts->ring_phys + (u64)evts->nidx * XHCI_TRB_SIZE;
+            writel(&xhci->ir->erdp_low, (u32)erdp);
+            writel(&xhci->ir->erdp_high, (u32)(erdp >> 32));
+            return 0;  // Not a command complete
+        }
+        case ER_PORT_STATUS_CHANGE:
+        {
+            u32 port = ((etrb->ptr_low >> 24) & 0xff) - 1;
+            // SeaBIOS: read status, clear W1C change bits (preserve PED, PR, PLS)
+            u32 portsc = readl(&xhci->pr[port].portsc);
+            u32 pclear = (((portsc & ~(XHCI_PORTSC_PED | XHCI_PORTSC_PR))
+                           & ~(XHCI_PORTSC_PLS_MASK << XHCI_PORTSC_PLS_SHIFT))
+                          | (1 << XHCI_PORTSC_PLS_SHIFT));
+            writel(&xhci_port_reg(xhci, port)->portsc, pclear);
+            fprintf(stderr, "xhci: evt: port %d status change PORTSC=0x%08x\n",
+                    port, portsc);
+            break;
+        }
+        default:
+            fprintf(stderr, "xhci: evt: unknown event type %d, cc %d\n",
+                    evt_type, evt_cc);
+            break;
+        }
+
+        // Advance event ring index
+        nidx++;
+        if (nidx == evts->size) {
+            nidx = 0;
+            evts->cs ^= 1;
+        }
+        evts->nidx = nidx;
+
+        // Update ERDP register
+        u64 erdp = evts->ring_phys + (u64)nidx * XHCI_TRB_SIZE;
+        writel(&xhci->ir->erdp_low, (u32)erdp);
+        writel(&xhci->ir->erdp_high, (u32)(erdp >> 32));
+    }
+}
+
+// Wait for event ring to have at least one pending event
+static int
+evt_ring_has_event(struct xhci_ring *evts)
+{
+    struct xhci_trb *trb = &evts->ring[evts->nidx];
+    int expected_cs = evts->cs ? 1 : 0;
+    return (trb->control & TRB_C) == (expected_cs ? TRB_C : 0);
+}
+
+int
+xhci_event_wait(void *handle, u64 *event_trb, int timeout_ms)
+{
+    struct usb_xhci_s *xhci = handle;
+    struct xhci_ring *evts = xhci->evts;
+    int polls = timeout_ms;
+
+    // Wait until there's at least one event on the event ring
+    if (!evt_ring_has_event(evts)) {
+        if (xhci->irq_efd >= 0) {
+            struct pollfd pfd = { .fd = xhci->irq_efd, .events = POLLIN };
+            int ret = poll(&pfd, 1, timeout_ms);
+            if (ret <= 0)
+                return -1;
+
+            // Drain eventfd
+            u64 efd_val;
+            ssize_t nr = read(xhci->irq_efd, &efd_val, sizeof(efd_val));
+            (void)nr;
+
+            xhci_irq_ack(xhci);
+        } else {
+            // Polling mode (SeaBIOS pattern)
+            while (polls-- > 0) {
+                if (evt_ring_has_event(evts))
+                    break;
+                msleep(1);
+            }
+            if (polls <= 0)
+                return -1;
+        }
+    }
+
+    // Process all pending events until we find a COMMAND_COMPLETE
+    // (SeaBIOS: cmds->evt gets CMD_COMPLETE, other events are handled inline)
+    int found_cmd = 0;
+    int retries = timeout_ms;
+
+    // Don't reset event ring - process from current position
+    while (!found_cmd && retries-- > 0) {
+        found_cmd = xhci_process_events(xhci);
+        if (!found_cmd) {
+            // No COMMAND_COMPLETE yet — wait for more events
+            if (xhci->irq_efd >= 0) {
+                struct pollfd pfd = { .fd = xhci->irq_efd, .events = POLLIN };
+                int ret = poll(&pfd, 1, 1);
+                if (ret > 0) {
+                    u64 efd_val;
+                    read(xhci->irq_efd, &efd_val, sizeof(efd_val));
+                    xhci_irq_ack(xhci);
+                }
+            } else {
+                msleep(1);
+            }
+        }
+    }
+    if (!found_cmd)
+        return -1;
+
+    // Read command completion from cmds->evt (SeaBIOS pattern)
+    struct xhci_trb *trb = &xhci->cmds->evt;
+    u32 status = trb->status;
+    u32 control = trb->control;
+    u32 cc = (status >> 24) & 0xff;
+    u32 evt_type = (control >> TRB_TYPE_SHIFT) & TRB_TYPE_MASK;
+
+    fprintf(stdout, "[EVENT] cmd_evt: status=0x%08x ctrl=0x%08x cc=%d(%s) type=%s\n",
+            status, control, cc, cc_name_safe(cc), trb_type_name(evt_type));
+
+    if (event_trb)
+        *event_trb = status | ((u64)control << 32);
+
+    return 0;
+}
+
+void
+xhci_irq_ack(void *handle)
+{
+    struct usb_xhci_s *xhci = handle;
+    u32 iman = readl(&xhci->ir->iman);
+    iman |= XHCI_IMAN_IP;  // Write 1 to clear
+    writel(&xhci->ir->iman, iman);
+}
+
+void
+xhci_irq_set_imod(void *handle, int interrupter, u16 imod)
+{
+    struct usb_xhci_s *xhci = handle;
+    struct xhci_ir *ir = (struct xhci_ir *)((u8 *)xhci->ir + interrupter * 0x20);
+    writel(&ir->imod, imod);
+}
+
+/****************************************************************
+ * Command Ring & Submission (SeaBIOS-style)
+ ****************************************************************/
+
+static int
+cmd_ring_alloc(struct usb_xhci_s *xhci)
+{
+    xhci->cmds = calloc(1, sizeof(*xhci->cmds));
+    if (!xhci->cmds)
+        return -1;
+
+    xhci->cmds->size = XHCI_RING_ITEMS;
+    // This controller's initial CRCS is 1 (not 0 as spec says).
+    // ER events also use CS=1, confirming controller's cycle state starts at 1.
+    xhci->cmds->cs = 1;
+    xhci->cmds->nidx = 0;
+    xhci->cmds->eidx = 0;
+    xhci->cmds->ring = xhci_dma_alloc(xhci, XHCI_RING_ITEMS * XHCI_TRB_SIZE,
+                                      &xhci->cmds->ring_phys);
+    if (!xhci->cmds->ring) {
+        free(xhci->cmds);
+        xhci->cmds = NULL;
+        return -1;
+    }
+    memset(xhci->cmds->ring, 0, XHCI_RING_ITEMS * XHCI_TRB_SIZE);
+
+    // Set CRCR: ring base address + RCS (cycle state).
+    // This controller doesn't support CRCR readback (always returns 0),
+    // so don't try to preserve bits — write full value directly.
+    // DO NOT set RRC (bit 0) here! Set it in xhci_run when RS is set.
+    u64 crcr = (xhci->cmds->ring_phys & ~0x3FULL);  /* ring base only */
+    // CRCS (Command Ring Cycle State) is bit 1 of CRCR
+    if (xhci->cmds->cs)
+        crcr |= (1ULL << 1);  /* CRCS = 1 */
+
+    // Write as 64-bit: low first, then high (xHCI spec requires lo-then-hi)
+    writel(&xhci->op->crcr_low, (u32)crcr);
+    writel(&xhci->op->crcr_high, (u32)(crcr >> 32));
+
+    fprintf(stderr, "xhci: cmd_ring: wrote CRCR=0x%08x%08x (CRCS=%d)\n",
+            (u32)(crcr >> 32), (u32)crcr, (int)((crcr >> 1) & 1));
+
+    // Verify CRCR readback
+    u32 crcr_rl = readl(&xhci->op->crcr_low);
+    u32 crcr_rh = readl(&xhci->op->crcr_high);
+    fprintf(stderr, "xhci: cmd_ring: read CRCR=0x%08x%08x (match=%d)\n",
+            crcr_rh, crcr_rl, crcr_rl == (u32)crcr && crcr_rh == (u32)(crcr >> 32));
+
+    fprintf(stderr, "xhci: cmd_ring: phys=0x%llx, n=%d, CS=%d, nidx=0\n",
+            (unsigned long long)xhci->cmds->ring_phys, xhci->cmds->size, xhci->cmds->cs);
+    return 0;
+}
+
+// Unified command submit: queue TRB → doorbell → wait for event (SeaBIOS pattern)
+static int
+xhci_cmd_submit(struct usb_xhci_s *xhci, u64 parameter, u32 trb_type, u32 slot_id)
+{
+    u32 trb_ctrl = 0;
+    if (slot_id)
+        trb_ctrl |= (slot_id << TRB_CR_SLOTID_SHIFT);
+    trb_ctrl |= (trb_type << TRB_TYPE_SHIFT);
+    /* BEI (bit 9) is only for Transfer TRBs. For command TRBs it is
+     * reserved or interpreted as DC — setting it causes undefined behavior. */
+
+    xhci_trb_queue(xhci->cmds, (void*)(uintptr_t)parameter, 0, trb_ctrl);
+
+    // Dump the actual TRB that was queued
+    struct xhci_trb *trb_dump = &xhci->cmds->ring[xhci->cmds->nidx - 1];
+    fprintf(stderr, "  TRB queued: ptr=0x%08x%08x status=0x%08x ctrl=0x%08x\n",
+            trb_dump->ptr_high, trb_dump->ptr_low, trb_dump->status, trb_dump->control);
+    fprintf(stderr, "    slot_id=%u type=%u CS=%d DC=%d\n",
+            (trb_dump->control >> 24) & 0xff,
+            (trb_dump->control >> 10) & 0x3f,
+            trb_dump->control & 1,
+            (trb_dump->control >> 9) & 1);
+
+    // Dump DCBAAP and CONFIG registers at command time
+    u32 dcbaap_l = readl(&xhci->op->dcbaap_low);
+    u32 dcbaap_h = readl(&xhci->op->dcbaap_high);
+    u32 config = readl(&xhci->op->config);
+    fprintf(stderr, "  DCBAAP=0x%08x%08x CONFIG=%d\n",
+            dcbaap_h, dcbaap_l, config);
+
+    //xhci_trb_queue(xhci->cmds, (void*)(uintptr_t)parameter, 0, trb_ctrl);
+
+    fprintf(stderr, "xhci: cmd: %s (type=%d) slot=%d param=0x%llx CS=%d nidx=%d\n",
+            trb_type_name(trb_type), trb_type, slot_id,
+            (unsigned long long)parameter, xhci->cmds->cs, xhci->cmds->nidx);
+
+    // Ring doorbell for Command Ring (target 0)
+    fprintf(stderr, "  Ringing doorbell 0...\n");
+    writel(&xhci->db[0].doorbell, 0);
+
+    // Wait for completion event
+    u64 event;
+    int ret = xhci_event_wait(xhci, &event, XHCI_TIME_EVENT);
+    if (ret < 0) {
+        fprintf(stderr, "xhci_cmd_submit: timeout waiting for event\n");
+        fprintf(stderr, "  USBSTS = 0x%08x\n", readl(&xhci->op->usbsts));
+        return -1;
+    }
+
+    // Check completion code (stored in event's status field, lower 32 bits)
+    u32 event_status = (u32)event;
+    u32 cc = (event_status >> 24) & 0xff;
+    if (cc != CC_SUCCESS) {
+        fprintf(stderr, "xhci_cmd_submit: completion code %d (%s)\n", cc, cc_name_safe(cc));
+        fprintf(stderr, "  event status=0x%08x\n", event_status);
+        return -1;
+    }
+
+    // Advance eidx to match nidx (SeaBIOS: ring->eidx = ring->nidx)
+    xhci->cmds->eidx = xhci->cmds->nidx;
+
+    // DO NOT flip cycle state here — SeaBIOS only flips on ring wrap (LINK TRB).
+    // The controller's consumer CS stays in sync with our producer CS
+    // until a LINK TRB with TC bit is encountered.
+
+    fprintf(stderr, "xhci: cmd: %s complete (slot=%d, cs=%d)\n",
+            trb_type_name(trb_type), slot_id, xhci->cmds->cs);
+
+    // If this was ADDRESS_DEVICE, dump the device context for debugging
+    if (trb_type == CR_ADDRESS_DEVICE) {
+        // Dump DCBAAP register value (what controller reads)
+        u32 dcbaap_l = readl(&xhci->op->dcbaap_low);
+        u32 dcbaap_h = readl(&xhci->op->dcbaap_high);
+        u64 dcbaap = (u64)dcbaap_l | ((u64)dcbaap_h << 32);
+        fprintf(stderr, "  DCBAAP reg = 0x%llx\n", (unsigned long long)dcbaap);
+
+        // Verify DCBAAP matches our dcbaa_phys
+        struct xhci_devlist *dcbaa = xhci_get_dcbaa(xhci, &dcbaap);
+        fprintf(stderr, "  DCBAA phys (from alloc) = 0x%llx\n", (unsigned long long)dcbaap);
+
+        if (dcbaa && slot_id <= 64 && dcbaa[slot_id].ptr_low != 0) {
+            u64 dev_phys = (u64)dcbaa[slot_id].ptr_low | ((u64)dcbaa[slot_id].ptr_high << 32);
+            fprintf(stderr, "  DCBAA[%d] = 0x%llx (device context address)\n", slot_id, (unsigned long long)dev_phys);
+            // Check if this physical address is mapped
+            int found = 0;
+            for (int i = 0; i < xhci->dma_count; i++) {
+                if (xhci->dma_iovas[i] == dev_phys) {
+                    volatile u32 *dev = (volatile u32 *)xhci->dma_vaddrs[i];
+                    fprintf(stderr, "  DevCtx dump (DWORD 0-31):\n");
+                    for (int j = 0; j < 32; j++) {
+                        if (j % 8 == 0) fprintf(stderr, "    ");
+                        fprintf(stderr, "[%2d]=0x%08x ", j, dev[j]);
+                        if (j % 8 == 7) fprintf(stderr, "\n");
+                    }
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found) {
+                fprintf(stderr, "  DevCtx phys=0x%llx NOT FOUND in DMA map!\n", (unsigned long long)dev_phys);
+                // Check if DCBAAP itself is mapped
+                int dcbaa_found = 0;
+                for (int i = 0; i < xhci->dma_count; i++) {
+                    if (xhci->dma_iovas[i] == dcbaap) {
+                        dcbaa_found = 1;
+                        fprintf(stderr, "  DCBAAP IS mapped at index %d\n", i);
+                        break;
+                    }
+                }
+                if (!dcbaa_found) {
+                    fprintf(stderr, "  DCBAAP is NOT mapped in DMA!\n");
+                }
+            }
+        } else {
+            fprintf(stderr, "  DCBAA[%d] is zero or slot_id=%d out of range (max_slots=%d)\n",
+                    slot_id, slot_id, xhci->max_slots);
+        }
+    }
+    return 0;
+}
+
+// Keep old public API as thin wrapper for backward compatibility
+int
+xhci_cmd_issue(void *handle, u32 trb_type, u64 parameter,
+               u32 trb_ctrl, u64 *event_trb_out)
+{
+    struct usb_xhci_s *xhci = handle;
+    u32 slot_id = (trb_ctrl >> TRB_CR_SLOTID_SHIFT) & 0xff;
+    // Merge trb_ctrl type into trb_ctrl
+    u32 flags = trb_ctrl | (trb_type << TRB_TYPE_SHIFT);
+
+    xhci_trb_queue(xhci->cmds, (void*)(uintptr_t)parameter, 0, flags);
+
+    fprintf(stderr, "xhci: cmd: %s (type=%d) slot=%d param=0x%llx CS=%d\n",
+            trb_type_name(trb_type), trb_type, slot_id,
+            (unsigned long long)parameter, xhci->cmds->cs);
+
+    writel(&xhci->db[0].doorbell, 0);
+
+    u64 event;
+    int ret = xhci_event_wait(xhci, &event, XHCI_TIME_EVENT);
+    if (ret < 0) {
+        fprintf(stderr, "xhci_cmd_issue: timeout waiting for event\n");
+        return -1;
+    }
+
+    if (event_trb_out)
+        *event_trb_out = event;
+
+    u32 event_status = (u32)event;
+    u32 cc = (event_status >> 24) & 0xff;
+    if (cc != CC_SUCCESS) {
+        fprintf(stderr, "xhci_cmd_issue: completion code %d (%s)\n", cc, cc_name_safe(cc));
+        return -1;
+    }
+
+    xhci->cmds->eidx = xhci->cmds->nidx;
+    return 0;
+}
+
+// Command ring public init (backward compat)
+int
+xhci_cmd_ring_init(void *handle)
+{
+    return cmd_ring_alloc(handle);
+}
+
+/****************************************************************
+ * Slots / Device operations
+ ****************************************************************/
+
+int
+xhci_enable_slot(void *handle)
+{
+    struct usb_xhci_s *xhci = handle;
+    int ret = xhci_cmd_submit(xhci, 0, CR_ENABLE_SLOT, 0);
+    if (ret < 0)
+        return -1;
+    /* SeaBIOS: slot ID is in cmds->evt control bits 24-31 */
+    u32 slot_id = (xhci->cmds->evt.control >> 24) & 0xff;
+    fprintf(stderr, "xhci: enable_slot: slot_id=%u\n", slot_id);
+    return (int)slot_id;
+}
+
+int
+xhci_address_device(void *handle, int slot_id, u64 input_ctx_phys)
+{
+    struct usb_xhci_s *xhci = handle;
+    return xhci_cmd_submit(xhci, input_ctx_phys, CR_ADDRESS_DEVICE, (u32)slot_id);
+}
+
+int
+xhci_configure_endpoint(void *handle, int slot_id, u64 input_ctx_phys)
+{
+    struct usb_xhci_s *xhci = handle;
+    u32 trb_ctrl = (slot_id << TRB_CR_SLOTID_SHIFT) | TRB_CR_DC;
+    return xhci_cmd_submit(xhci, input_ctx_phys, CR_CONFIGURE_ENDPOINT, trb_ctrl);
+}
+
+/****************************************************************
+ * DCBAA verification
+ ****************************************************************/
+
+int
+xhci_dcbaa_verify(void *handle, int slot_id)
+{
+    struct usb_xhci_s *xhci = handle;
+
+    if (slot_id < 1 || slot_id > xhci->max_slots)
+        return -1;
+
+    if (xhci->dcbaa[slot_id].ptr_low == 0)
+        return -1;
+
+    // Device context must be 64-byte aligned
+    if (xhci->dcbaa[slot_id].ptr_low & 0x3f)
+        return -1;
+
+    return 0;
+}
+
+/****************************************************************
+ * Event Ring
+ ****************************************************************/
+
+int
+xhci_event_ring_init(void *handle, int num_entries)
+{
+    struct usb_xhci_s *xhci = handle;
+
+    xhci->evts = calloc(1, sizeof(*xhci->evts));
+    if (!xhci->evts)
+        return -1;
+
+    xhci->evts->size = num_entries;
+    xhci->evts->cs = 1;
+
+    // Allocate Event Ring
+    xhci->evts->ring = xhci_dma_alloc(xhci, num_entries * XHCI_TRB_SIZE,
+                                      &xhci->evts->ring_phys);
+    if (!xhci->evts->ring) {
+        free(xhci->evts);
+        xhci->evts = NULL;
+        return -1;
+    }
+    memset(xhci->evts->ring, 0, num_entries * XHCI_TRB_SIZE);
+
+    // Allocate ERST (one segment)
+    xhci->evt_seg = xhci_dma_alloc(xhci, XHCI_PAGE_SIZE, &xhci->evt_seg_phys);
+    if (!xhci->evt_seg) {
+        xhci_dma_free(xhci, xhci->evts->ring, num_entries * XHCI_TRB_SIZE);
+        free(xhci->evts);
+        xhci->evts = NULL;
+        return -1;
+    }
+    memset(xhci->evt_seg, 0, XHCI_PAGE_SIZE);
+
+    xhci->evt_seg->ptr_low = (u32)xhci->evts->ring_phys;
+    xhci->evt_seg->ptr_high = (u32)(xhci->evts->ring_phys >> 32);
+    xhci->evt_seg->size = num_entries;
+
+    // Write registers: ERSTSZ, ERDP, ERSTBA (SeaBIOS order)
+    writel(&xhci->ir->erstsz, 1);
+    writel(&xhci->ir->erdp_low, (u32)xhci->evts->ring_phys);
+    writel(&xhci->ir->erdp_high, (u32)(xhci->evts->ring_phys >> 32));
+    writel(&xhci->ir->erstba_low, (u32)xhci->evt_seg_phys);
+    writel(&xhci->ir->erstba_high, (u32)(xhci->evt_seg_phys >> 32));
+
+    // Event ring TRBs all start with CS=0 (memset above).
+    // The controller will produce events with CS=1 matching its producer state.
+
+    // Disable interrupter (pure polling mode)
+    writel(&xhci->ir->iman, 0);
+
+    fprintf(stderr, "xhci: evt_ring: n=%d, phys=0x%llx, erstsz=1\n",
+            num_entries, (unsigned long long)xhci->evts->ring_phys);
+
+    return 0;
+}
+
+/****************************************************************
+ * Port operations
+ ****************************************************************/
+
+int
+xhci_port_count(void *handle)
+{
+    struct usb_xhci_s *xhci = handle;
+    if (xhci->max_ports > 0)
+        return xhci->max_ports;
+    // Not yet initialized — read directly from capability register
+    u32 hcs1 = readl(&xhci->caps->hcsparams1);
+    return XHCI_HCS1_MAX_PORTS(hcs1);
+}
+
+u32
+xhci_port_read(void *handle, int port)
+{
+    struct usb_xhci_s *xhci = handle;
+    return readl(&xhci_port_reg(xhci, port)->portsc);
+}
+
+void
+xhci_port_write(void *handle, int port, u32 val)
+{
+    struct usb_xhci_s *xhci = handle;
+    writel(&xhci_port_reg(xhci, port)->portsc, val);
+}
+
+int
+xhci_port_link_state(void *handle, int port)
+{
+    u32 portsc = xhci_port_read(handle, port);
+    return xhci_get_field(portsc, XHCI_PORTSC_PLS);
+}
+
+int
+xhci_port_set_link_state(void *handle, int port, int state)
+{
+    struct usb_xhci_s *xhci = handle;
+    u32 portsc = readl(&xhci_port_reg(xhci, port)->portsc);
+    portsc &= ~(XHCI_PORTSC_PLS_MASK << XHCI_PORTSC_PLS_SHIFT);
+    portsc |= (state << XHCI_PORTSC_PLS_SHIFT);
+    // Clear change bits (W1C)
+    portsc |= XHCI_PORTSC_PLC | XHCI_PORTSC_CSC | XHCI_PORTSC_PEC;
+    writel(&xhci_port_reg(xhci, port)->portsc, portsc);
+    return 0;
+}
+
+int
+xhci_port_warm_reset(void *handle, int port)
+{
+    struct usb_xhci_s *xhci = handle;
+    struct xhci_pr *pr = xhci_port_reg(xhci, port);
+    u32 portsc;
+    int timeout;
+
+    portsc = readl(&pr->portsc);
+
+    // SeaBIOS xhci_hub_reset() pattern:
+    // USB3 (PLS_U0): controller auto-performs reset, just wait for PED
+    // USB2 (PLS_POLLING): set PR bit manually
+    u8 pls = (portsc >> XHCI_PORTSC_PLS_SHIFT) & 0xf;
+
+    if (pls == PLS_U0) {
+        // USB3 port in U0 — controller handles reset automatically.
+        // Wait for PED (Port Enabled), SeaBIOS timeout: 100ms
+        fprintf(stderr, "xhci: port[%d]: USB3 in U0, waiting for PED...\n", port);
+        timeout = 100;  // SeaBIOS uses 100ms
+        while (timeout-- > 0) {
+            portsc = readl(&pr->portsc);
+            if (!(portsc & XHCI_PORTSC_CCS))
+                return -1;  // Device disconnected
+            if (portsc & XHCI_PORTSC_PED) {
+                // Clear change bits (SeaBIOS pattern: preserve PED, PR, PLS)
+                u32 pclear = (((portsc & ~(XHCI_PORTSC_PED | XHCI_PORTSC_PR))
+                               & ~(XHCI_PORTSC_PLS_MASK << XHCI_PORTSC_PLS_SHIFT))
+                              | (1 << XHCI_PORTSC_PLS_SHIFT));
+                writel(&pr->portsc, pclear);
+                return 0;
+            }
+            msleep(1);
+        }
+        fprintf(stderr, "xhci_port_warm_reset: port %d never enabled (PED timeout)\n", port);
+        return -1;
+    }
+
+    // USB2 port (Polling/Recovery/etc): set PR bit to trigger reset
+    fprintf(stderr, "xhci: port[%d]: USB2 PLS=%d, setting PR (PORTSC=0x%08x)\n",
+            port, pls, portsc);
+    writel(&pr->portsc, portsc | XHCI_PORTSC_PR);
+
+    // Wait for PR bit to clear (reset complete), SeaBIOS timeout: 100ms
+    timeout = 100;
+    while (timeout-- > 0) {
+        portsc = readl(&pr->portsc);
+        if (!(portsc & XHCI_PORTSC_PR))
+            break;
+        msleep(1);
+    }
+    if (timeout <= 0) {
+        fprintf(stderr, "xhci_port_warm_reset: PR never cleared\n");
+        return -1;
+    }
+
+    // Wait for PED (Port Enabled)
+    timeout = 100;
+    while (timeout-- > 0) {
+        portsc = readl(&pr->portsc);
+        if (!(portsc & XHCI_PORTSC_CCS))
+            return -1;
+        if (portsc & XHCI_PORTSC_PED) {
+            // Clear change bits
+            u32 pclear = (((portsc & ~(XHCI_PORTSC_PED | XHCI_PORTSC_PR))
+                           & ~(XHCI_PORTSC_PLS_MASK << XHCI_PORTSC_PLS_SHIFT))
+                          | (1 << XHCI_PORTSC_PLS_SHIFT));
+            writel(&pr->portsc, pclear);
+            return 0;
+        }
+        msleep(1);
+    }
+    fprintf(stderr, "xhci_port_warm_reset: PED timeout on port %d\n", port);
+    return -1;
+}
+
+int
+xhci_port_find_changed(void *handle)
+{
+    struct usb_xhci_s *xhci = handle;
+    for (int i = 0; i < xhci->max_ports; i++) {
+        u32 portsc = readl(&xhci_port_reg(xhci, i)->portsc);
+        if (portsc & XHCI_PORTSC_CSC)
+            return i;
+    }
+    return -1;
+}
+
+/****************************************************************
+ * Transfer Ring
+ ****************************************************************/
+
+struct transfer_ring {
+    struct xhci_trb *virt;
+    u64 phys;
+    int size;
+    int nidx;
+    int cs;
+};
+
+void *
+xhci_transfer_ring_create(void *handle, int num_entries)
+{
+    struct usb_xhci_s *xhci = handle;
+    struct transfer_ring *ring = calloc(1, sizeof(*ring));
+    if (!ring)
+        return NULL;
+
+    ring->size = num_entries;
+    ring->cs = 1;
+    ring->virt = xhci_dma_alloc(xhci, num_entries * XHCI_TRB_SIZE, &ring->phys);
+    if (!ring->virt) {
+        free(ring);
+        return NULL;
+    }
+    memset(ring->virt, 0, num_entries * XHCI_TRB_SIZE);
+
+    // Set up LINK TRB at the end of the ring for proper ring wrapping
+    struct xhci_trb *link_trb = &ring->virt[num_entries - 1];
+    link_trb->ptr_low = (u32)ring->phys;
+    link_trb->ptr_high = (u32)(ring->phys >> 32);
+    link_trb->status = 0;
+    link_trb->control = (TR_LINK << TRB_TYPE_SHIFT) | TRB_LK_TC | TRB_C;  // CS=1, TC=1
+
+    // Set first TRB's cycle bit to match DCS=1 for Address Device command.
+    struct xhci_trb *first_trb = ring->virt;
+    first_trb->control = TRB_C;  // CS=1
+
+    ring->nidx = 0;
+
+    return ring;
+}
+
+void
+xhci_transfer_ring_free(void *handle, void *ring_ptr)
+{
+    struct usb_xhci_s *xhci = handle;
+    struct transfer_ring *ring = ring_ptr;
+    if (!ring) return;
+    xhci_dma_free(xhci, ring->virt, ring->size * XHCI_TRB_SIZE);
+    free(ring);
+}
+
+u64
+xhci_transfer_ring_phys(void *handle, void *ring_ptr)
+{
+    (void)handle;
+    struct transfer_ring *ring = ring_ptr;
+    return ring ? ring->phys : 0;
+}
+
+int
+xhci_transfer_ring_cycle_state(void *ring_ptr)
+{
+    struct transfer_ring *ring = ring_ptr;
+    return ring ? ring->cs : 1;
+}
+
+int
+xhci_transfer_enqueue(void *handle, void *ring_ptr,
+                      u64 data_phys, u32 len,
+                      u32 td_size, u32 intr_target,
+                      u32 trb_ctrl)
+{
+    (void)handle;
+    struct transfer_ring *ring = ring_ptr;
+    if (!ring) return -1;
+
+    struct xhci_trb *trb = &ring->virt[ring->nidx];
+
+    trb->ptr_low = (u32)data_phys;
+    trb->ptr_high = (u32)((u64)data_phys >> 32);
+    trb->status = (td_size << 17) | (len & 0x1ffff);
+
+    u32 xhci = trb_ctrl;
+    xhci |= (intr_target << TRB_INTR_SHIFT);
+    xhci |= (ring->cs ? TRB_C : 0);
+    xhci |= (TR_NORMAL << TRB_TYPE_SHIFT);
+    trb->control = xhci;
+
+    ring->nidx++;
+    if (ring->nidx == ring->size) {
+        ring->nidx = 0;
+        ring->cs ^= 1;
+    }
+
+    return 0;
+}
+
+void
+xhci_doorbell(void *handle, int slot_id, int endpoint)
+{
+    struct usb_xhci_s *xhci = handle;
+    u32 target = endpoint ? endpoint : XHCI_DB_SLOT_CMD;
+    writel(&xhci->db[slot_id].doorbell, target);
+}
+
+/****************************************************************
+ * Control Transfers (EP0)
+ ****************************************************************/
+
+// Control transfer using physical address for data buffer
+int
+xhci_control_transfer_phys(void *handle, int slot_id, void *ep0_ring,
+                           const u8 setup_data[8],
+                           u64 data_phys, u32 data_len,
+                           int direction)
+{
+    struct transfer_ring *ring = ep0_ring;
+    int n_trbs = data_len > 0 ? 3 : 2;
+    struct xhci_trb *trb;
+    int ret = 0;
+
+    if (!ring) {
+        fprintf(stderr, "xhci_control_transfer_phys: no EP0 ring\n");
+        return -1;
+    }
+
+    // Do NOT reset ring pointers - keep enqueue position advancing
+    // The controller tracks its own dequeue pointer
+
+    // SETUP stage TRB with IDT flag (data is inline in TRB)
+    trb = &ring->virt[ring->nidx];
+    memcpy(&trb->ptr_low, setup_data, 8);
+    trb->status = 0;
+    u32 setup_ctrl = (TR_SETUP << TRB_TYPE_SHIFT) | TRB_TR_IDT | (ring->cs ? TRB_C : 0);
+    // 加 TRT: 有数据时根据方向设 IN/OUT, 无数据时设 0
+    if (data_len > 0) {
+        setup_ctrl |= (direction ? 3 : 2) << 16;  // TRT = 3 (IN) 或 2 (OUT)
+    }
+    trb->control = setup_ctrl;
+    ring->nidx++;
+    if (ring->nidx == ring->size) { ring->nidx = 0; ring->cs ^= 1; }
+
+    fprintf(stderr, "xhci: ctl: slot=%d n_trbs=%d CS=%d bmReqType=0x%02x bReq=0x%02x wValue=0x%04x len=%d\n",
+            slot_id, n_trbs, ring->cs,
+            setup_data[0], setup_data[1], setup_data[3] << 8 | setup_data[2], data_len);
+
+    // DATA stage TRB (optional) - uses physical address
+    if (data_len > 0) {
+        fprintf(stderr, "xhci: ctl: DATA TRB phys=0x%llx len=%u dir=%d\n",
+                (unsigned long long)data_phys, data_len, direction);
+        trb = &ring->virt[ring->nidx];
+        trb->ptr_low = (u32)data_phys;
+        trb->ptr_high = (u32)(data_phys >> 32);
+        trb->status = data_len & 0x1ffff;
+        u32 xhci = (TR_DATA << TRB_TYPE_SHIFT) | (ring->cs ? TRB_C : 0);
+        xhci |= direction ? TRB_TR_DIR : 0;  // DIR: 1=IN, 0=OUT
+        //xhci |= TRB_TR_ISP;
+        trb->control = xhci;
+        ring->nidx++;
+        if (ring->nidx == ring->size) { ring->nidx = 0; ring->cs ^= 1; }
+    }
+
+    // STATUS stage TRB
+    trb = &ring->virt[ring->nidx];
+    trb->ptr_low = 0;
+    trb->ptr_high = 0;
+    trb->status = 0;
+    u32 status_ctrl = (TR_STATUS << TRB_TYPE_SHIFT) | (ring->cs ? TRB_C : 0);
+    status_ctrl |= direction ? 0 : (1 << 16);  // DIR opposite of data
+    status_ctrl |= TRB_TR_IOC;
+    trb->control = status_ctrl;
+    ring->nidx++;
+    if (ring->nidx == ring->size) { ring->nidx = 0; ring->cs ^= 1; }
+
+    // Ring doorbell: slot_id, target 0 for control endpoint (EP0)
+    // Per xHCI spec, target 0 is used for both Command Ring and Control EP
+    // For control transfers after Address Device, we use the transfer ring doorbell
+    fprintf(stderr, "xhci: ctl: ringing doorbell for slot=%d target=0\n", slot_id);
+
+    // Skip past existing events in event ring
+    struct xhci_ring *evts = ((struct usb_xhci_s *)handle)->evts;
+    // Don't clear the event ring - let the controller write events
+    // Just skip past any existing events
+    int skipped = 0;
+    for (int skip = 0; skip < evts->size; skip++) {
+        struct xhci_trb *etrb = &evts->ring[evts->nidx];
+        int expected_cs = evts->cs ? 1 : 0;
+        if ((etrb->control & TRB_C) == (expected_cs ? TRB_C : 0)) {
+            // Advance past this existing event
+            int nidx_next = evts->nidx + 1;
+            if (nidx_next >= evts->size) {
+                nidx_next = 0;
+                evts->cs ^= 1;
+            }
+            evts->nidx = nidx_next;
+            skipped++;
+        } else {
+            break;
+        }
+    }
+
+    // Update ERDP to current position (tell controller where to write next)
+    u64 erdp_pre = evts->ring_phys + (u64)evts->nidx * XHCI_TRB_SIZE;
+    writel(&((struct usb_xhci_s *)handle)->ir->erdp_low, (u32)erdp_pre);
+    writel(&((struct usb_xhci_s *)handle)->ir->erdp_high, (u32)(erdp_pre >> 32));
+    fprintf(stderr, "xhci: ctl: skipped %d events, nidx=%d cs=%d erdp=0x%llx\n", skipped, evts->nidx, evts->cs, (unsigned long long)erdp_pre);
+
+    // Dump event ring state after waiting
+    fprintf(stderr, "xhci: ctl: before wait nidx=%d cs=%d\n", evts->nidx, evts->cs);
+    for (int dbge = 0; dbge < 8; dbge++) {
+        fprintf(stderr, "  ER[%d]: ctrl=0x%08x type=%d cc=%d CS=%d\n",
+                dbge, evts->ring[dbge].control,
+                (evts->ring[dbge].control >> TRB_TYPE_SHIFT) & TRB_TYPE_MASK,
+                (evts->ring[dbge].status >> 24) & 0xff,
+                evts->ring[dbge].control & TRB_C);
+    }
+    writel(&((struct usb_xhci_s *)handle)->db[slot_id].doorbell, 1);
+    fprintf(stderr, "xhci: ctl: doorbell rung, waiting for events...\n");
+
+    // Wait for controller to process
+    // Event-driven wait: only 1 Transfer Event expected (IOC is only on STATUS TRB)
+    // Poll the event ring for up to 3 seconds
+    int found = 0;
+    int polls = 3000;
+    while (polls-- > 0) {
+        struct xhci_trb *etrb = &evts->ring[evts->nidx];
+        int expected_cs = evts->cs ? 1 : 0;
+        u32 ctrl = etrb->control;
+        if ((ctrl & TRB_C) == (expected_cs ? TRB_C : 0)) {
+            u32 evt_type = (ctrl >> TRB_TYPE_SHIFT) & TRB_TYPE_MASK;
+            u32 cc = (etrb->status >> 24) & 0xff;
+            fprintf(stderr, "xhci: ctl: event ring[%d] type=%d(%s) cc=%d slot=%d ep=%d\n",
+                    evts->nidx, evt_type, trb_type_name(evt_type), cc,
+                    (etrb->status >> 16) & 0xff,  // slot_id from completion event
+                    (etrb->control) & 0x1f);       // endpoint from completion event
+            if (evt_type == ER_TRANSFER) {
+                found = 1;
+                if (cc != CC_SUCCESS && cc != CC_SHORT_PACKET) {
+                    fprintf(stderr, "xhci_control_transfer: transfer failed cc=%d\n", cc);
+                    ret = -1;
+                }
+                // Advance past this event
+                int nidx = evts->nidx + 1;
+                if (nidx >= evts->size) { nidx = 0; evts->cs ^= 1; }
+                evts->nidx = nidx;
+                u64 erdp = evts->ring_phys + (u64)evts->nidx * XHCI_TRB_SIZE;
+                writel(&((struct usb_xhci_s *)handle)->ir->erdp_low, (u32)erdp);
+                writel(&((struct usb_xhci_s *)handle)->ir->erdp_high, (u32)(erdp >> 32));
+                // Dump transfer event details: ptr and transfer length
+                fprintf(stderr, "xhci: ctl: xfer event ptr=0x%x%08x trlen=%u slot=%d\n",
+                        etrb->ptr_high, etrb->ptr_low, etrb->status & 0xffff,
+                        (etrb->status >> 16) & 0xff);
+                // Dump data buffer contents after DMA
+                if (data_len > 0 && data_phys) {
+                    // We need to read back from the DMA buffer
+                    // data_phys corresponds to the mmap'd buffer, but we don't have vaddr here
+                    fprintf(stderr, "xhci: ctl: data_phys=0x%llx data_len=%u\n",
+                            (unsigned long long)data_phys, data_len);
+                }
+                break;
+            }
+            // Skip non-transfer events (Port Status Change, etc.)
+            fprintf(stderr, "xhci: ctl: skipping event type=%d\n", evt_type);
+            int nidx_next = evts->nidx + 1;
+            if (nidx_next >= evts->size) { nidx_next = 0; evts->cs ^= 1; }
+            evts->nidx = nidx_next;
+            u64 erdp_next = evts->ring_phys + (u64)evts->nidx * XHCI_TRB_SIZE;
+            writel(&((struct usb_xhci_s *)handle)->ir->erdp_low, (u32)erdp_next);
+            writel(&((struct usb_xhci_s *)handle)->ir->erdp_high, (u32)(erdp_next >> 32));
+            continue;
+        }
+        msleep(1);
+    }
+    if (!found) {
+        fprintf(stderr, "xhci_control_transfer: transfer event timeout\n");
+        fprintf(stderr, "  Event ring nidx=%d cs=%d:\n", evts->nidx, evts->cs);
+        for (int e = 0; e < 8; e++) {
+            fprintf(stderr, "    ER[%d]: ctrl=0x%08x type=%d cc=%d CS=%d\n",
+                    e, evts->ring[e].control,
+                    (evts->ring[e].control >> TRB_TYPE_SHIFT) & TRB_TYPE_MASK,
+                    (evts->ring[e].status >> 24) & 0xff,
+                    evts->ring[e].control & TRB_C);
+        }
+        u32 usbsts = readl(&((struct usb_xhci_s *)handle)->op->usbsts);
+        fprintf(stderr, "  USBSTS = 0x%08x\n", usbsts);
+        ret = -1;
+    }
+
+    return ret;
+}
+
+int
+xhci_control_transfer(void *handle, int slot_id, void *ep0_ring,
+                      const u8 setup_data[8],
+                      void *data_buf, u32 data_len,
+                      int direction)
+{
+    struct transfer_ring *ring = ep0_ring;
+    int n_trbs = data_len > 0 ? 3 : 2;
+    struct xhci_trb *trb;
+    int ret = 0;
+
+    if (!ring) {
+        fprintf(stderr, "xhci_control_transfer: no EP0 ring\n");
+        return -1;
+    }
+
+    // SETUP stage TRB with IDT flag (data is inline in TRB)
+    trb = &ring->virt[ring->nidx];
+    memcpy(&trb->ptr_low, setup_data, 8);
+    trb->status = 0;
+    trb->control = (TR_SETUP << TRB_TYPE_SHIFT) | TRB_TR_IDT | (ring->cs ? TRB_C : 0);
+    ring->nidx++;
+    if (ring->nidx == ring->size) { ring->nidx = 0; ring->cs ^= 1; }
+
+    fprintf(stderr, "xhci: ctl: slot=%d n_trbs=%d CS=%d bmReqType=0x%02x bReq=0x%02x wValue=0x%04x len=%d\n",
+            slot_id, n_trbs, ring->cs,
+            setup_data[0], setup_data[1], setup_data[3] << 8 | setup_data[2], data_len);
+
+    // DATA stage TRB (optional)
+    if (data_len > 0) {
+        trb = &ring->virt[ring->nidx];
+        trb->ptr_low = (u32)(u64)data_buf;
+        trb->ptr_high = (u32)((u64)data_buf >> 32);
+        trb->status = data_len & 0x1ffff;
+        u32 xhci = (TR_DATA << TRB_TYPE_SHIFT) | (ring->cs ? TRB_C : 0);
+        xhci |= direction ? TRB_TR_DIR : 0;  // DIR: 1=IN, 0=OUT
+        xhci |= TRB_TR_ISP;
+        trb->control = xhci;
+        ring->nidx++;
+        if (ring->nidx == ring->size) { ring->nidx = 0; ring->cs ^= 1; }
+    }
+
+    // STATUS stage TRB
+    trb = &ring->virt[ring->nidx];
+    trb->ptr_low = 0;
+    trb->ptr_high = 0;
+    trb->status = 0;
+    u32 status_ctrl = (TR_STATUS << TRB_TYPE_SHIFT) | (ring->cs ? TRB_C : 0);
+    status_ctrl |= direction ? 0 : (1 << 16);  // DIR opposite of data
+    status_ctrl |= TRB_TR_IOC;
+    trb->control = status_ctrl;
+    ring->nidx++;
+    if (ring->nidx == ring->size) { ring->nidx = 0; ring->cs ^= 1; }
+
+    // Ring doorbell: slot_id, target 0 for control endpoint (EP0)
+    writel(&((struct usb_xhci_s *)handle)->db[slot_id].doorbell, 0);
+
+    // Only 1 Transfer Event expected (IOC only on STATUS TRB)
+    u64 event;
+    int ev_ret = xhci_event_wait(handle, &event, XHCI_TIME_EVENT);
+    if (ev_ret < 0) {
+        fprintf(stderr, "xhci_control_transfer: transfer event timeout\n");
+        ret = -1;
+    } else {
+        u32 event_ctrl = (u32)(event >> 32);
+        u32 cc = (event_ctrl >> 24) & 0xff;
+        if (cc != CC_SUCCESS && cc != CC_SHORT_PACKET) {
+            fprintf(stderr, "xhci_control_transfer: completion code %d\n", cc);
+            ret = -1;
+        }
+    }
+
+    return ret;
+}
+
+/****************************************************************
+ * Full initialization (SeaBIOS-style configure_xhci)
+ ****************************************************************/
+
+int
+xhci_full_init(void *handle)
+{
+    struct usb_xhci_s *xhci = handle;
+
+    xhci_debug_init();
+
+    fprintf(stderr, "xhci: full_init: starting\n");
+
+    // 1. Recover controller state (SeaBIOS configure_xhci pattern)
+    u32 cmd = readl(&xhci->op->usbcmd);
+    u32 sts = readl(&xhci->op->usbsts);
+
+    if (cmd & XHCI_CMD_RS) {
+        // Controller was running — stop it first (SeaBIOS)
+        fprintf(stderr, "xhci: controller was running, stopping...\n");
+        cmd &= ~XHCI_CMD_RS;
+        writel(&xhci->op->usbcmd, cmd);
+        if (wait_status(&xhci->op->usbsts, XHCI_STS_HCH, XHCI_STS_HCH, XHCI_TIME_HALT) != 0) {
+            fprintf(stderr, "xhci_full_init: timeout halting controller\n");
+            return -1;
+        }
+    }
+
+    // Perform Hard Reset (HCRST) to recover from HCE and ensure clean state
+    if (xhci_reset(xhci) < 0) {
+        fprintf(stderr, "xhci_full_init: HCRST failed\n");
+        return -1;
+    }
+
+    // Check if HCE persists after reset
+    sts = readl(&xhci->op->usbsts);
+    if (sts & XHCI_STS_HCE) {
+        // Try to clear it by writing 1 to the bit (Write-1-to-Clear)
+        fprintf(stderr, "xhci: HCE set after reset, attempting W1C clear...\n");
+        writel(&xhci->op->usbsts, XHCI_STS_HCE);
+        msleep(10);
+        sts = readl(&xhci->op->usbsts);
+    }
+
+    if (sts & XHCI_STS_HCE) {
+        fprintf(stderr, "xhci: HCE persists! Controller hardware error.\n");
+        return -1;
+    }
+
+    u32 sts_after = readl(&xhci->op->usbsts);
+    fprintf(stderr, "full_init: USBSTS after reset=0x%08x\n", sts_after);
+
+    // 2. Read capabilities
+    u32 hcs1 = readl(&xhci->caps->hcsparams1);
+    xhci->max_slots = XHCI_HCS1_MAX_SLOTS(hcs1);
+    xhci->max_ports = XHCI_HCS1_MAX_PORTS(hcs1);
+
+    u32 hcc = readl(&xhci->caps->hccparams);
+    u32 hcs2 = readl(&xhci->caps->hcsparams2);
+
+    fprintf(stderr, "full_init: slots=%d ports=%d HCC=0x%08x HCS2=0x%08x\n",
+            xhci->max_slots, xhci->max_ports, hcc, hcs2);
+
+    // 3. Enable slots via CONFIG register (SeaBIOS order)
+    if (xhci->max_slots > 0) {
+        writel(&xhci->op->config, xhci->max_slots);
+        fprintf(stderr, "xhci_full_init: CONFIG register set to %d (was %d)\n",
+                xhci->max_slots, readl(&xhci->op->config));
+    } else {
+        fprintf(stderr, "xhci_full_init: max_slots=0, not setting CONFIG\n");
+    }
+
+    // 4. Set DCBAA pointer
+    writel(&xhci->op->dcbaap_low, (u32)xhci->dcbaa_phys);
+    writel(&xhci->op->dcbaap_high, (u32)(xhci->dcbaa_phys >> 32));
+
+    // 5. Initialize Command Ring (SeaBIOS: program CRCR before scratchpad)
+    if (cmd_ring_alloc(xhci) < 0) {
+        fprintf(stderr, "xhci_full_init: cmd ring init failed\n");
+        goto fail_full_init;
+    }
+
+    // 6. Initialize Event Ring (SeaBIOS: program ERSTSZ/ERDP/ERSTBA before scratchpad)
+    if (xhci_event_ring_init(xhci, 256) < 0) {
+        fprintf(stderr, "xhci_full_init: event ring init failed\n");
+        goto fail_full_init;
+    }
+    // 7. Scratchpad buffers — AFTER all registers programmed (SeaBIOS order)
+    // xHCI spec: Max Scratchpad Buffers is in HCS2 bits 4:0 (xHCI 1.0)
+    // or bits 31:28 (Low) + 27:25 (High) for xHCI 1.1+.
+    // Use both: if HCC bit 26 (SPB) is set, controller uses xHCI 1.1+ encoding.
+    u32 max_scratchpad;
+    if (hcc & (1 << 26)) {
+        /* xHCI 1.1+ split encoding */
+        u32 sp_low  = (hcs2 >> 28) & 0xf;   /* bits 31:28 */
+        u32 sp_high = (hcs2 >> 25) & 0x7;   /* bits 27:25 */
+        max_scratchpad = (sp_high << 4) | sp_low;
+    } else {
+        /* xHCI 1.0: single 5-bit field at bits 4:0 */
+        max_scratchpad = hcs2 & 0x1f;
+    }
+    if (max_scratchpad)
+        max_scratchpad += 1;  /* xHCI spec: actual count = N + 1 */
+    if (max_scratchpad > 0) {
+        fprintf(stderr, "xhci: full_init: scratchpad buffers: %d (single block)\n", max_scratchpad);
+
+        u64 spba_phys;
+        u64 *spba = xhci_dma_alloc(xhci, max_scratchpad * sizeof(u64), &spba_phys);
+        if (!spba) {
+            fprintf(stderr, "xhci_full_init: scratchpad pointer array alloc failed\n");
+            goto fail_full_init;
+        }
+        xhci->dcbaa[0].ptr_low = (u32)(spba_phys);
+        xhci->dcbaa[0].ptr_high = (u32)(spba_phys >> 32);
+
+        // SeaBIOS pattern: allocate one contiguous block for all scratchpad buffers
+        u64 pad_phys;
+        void *pad = xhci_dma_alloc(xhci, XHCI_PAGE_SIZE * max_scratchpad, &pad_phys);
+        if (!pad) {
+            fprintf(stderr, "xhci_full_init: scratchpad block alloc failed\n");
+            xhci_dma_free(xhci, spba, max_scratchpad * sizeof(u64));
+            goto fail_full_init;
+        }
+        memset(pad, 0, XHCI_PAGE_SIZE * max_scratchpad);
+
+        for (u32 i = 0; i < max_scratchpad; i++) {
+            spba[i] = pad_phys + (i * XHCI_PAGE_SIZE);
+            fprintf(stderr, "xhci: full_init: scratchpad[%d] = 0x%llx\n", i, (unsigned long long)spba[i]);
+        }
+    }
+
+    // 8. Small delay before run to let DMA mappings settle
+    msleep(100);
+
+    // 9. Start controller
+    xhci_run(xhci);
+
+    // Check USBSTS immediately after run — HSE during command ring fetch is fatal
+    u32 sts_run = readl(&xhci->op->usbsts);
+    fprintf(stderr, "xhci_full_init: USBSTS after run=0x%08x (HCH=%d HSE=%d HCE=%d)\n",
+            sts_run,
+            !!(sts_run & XHCI_STS_HCH),
+            !!(sts_run & XHCI_STS_HSE),
+            !!(sts_run & XHCI_STS_HCE));
+
+    // 10. Wait for controller to come out of halted.
+    // HCE (if set) will prevent the controller from starting,
+    // so this wait implicitly covers HCE detection.
+    if (wait_status(&xhci->op->usbsts, XHCI_STS_HCH, 0, 3000) != 0) {
+        u32 sts = readl(&xhci->op->usbsts);
+        fprintf(stderr, "xhci_full_init: controller still halted after run (USBSTS=0x%08x HCE=%d)\n",
+                sts, !!(sts & XHCI_STS_HCE));
+        goto fail_full_init;
+    }
+
+    fprintf(stderr, "xhci: full_init: controller running\n");
+    return 0;
+
+fail_full_init:
+    /* Clean up partial allocations so caller can retry or close cleanly */
+    if (xhci->evts) {
+        if (xhci->evts->ring)
+            xhci_dma_free(xhci, xhci->evts->ring, xhci->evts->size * XHCI_TRB_SIZE);
+        if (xhci->evt_seg)
+            xhci_dma_free(xhci, xhci->evt_seg, XHCI_PAGE_SIZE);
+        free(xhci->evts);
+        xhci->evts = NULL;
+    }
+    if (xhci->cmds) {
+        if (xhci->cmds->ring)
+            xhci_dma_free(xhci, xhci->cmds->ring, XHCI_RING_ITEMS * XHCI_TRB_SIZE);
+        free(xhci->cmds);
+        xhci->cmds = NULL;
+    }
+    return -1;
+}

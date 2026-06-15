@@ -1,0 +1,7 @@
+# Large source trees (track via submodule or separate repo if needed)
+kernel_source/
+seabios/
+kb/
+
+# OpenClaw internal
+.openclaw/
