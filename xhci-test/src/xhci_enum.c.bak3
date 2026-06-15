@@ -359,73 +359,38 @@ xhci_state_enumerate(void *handle, struct xhci_state **state_out)
 
         // SeaBIOS relies on the controller to handle reset/link training.
         // Manually setting PR on Haiguang controllers via VFIO causes device disconnect (CCS=0).
-        // xHCI spec 4.19.3/4.19.4:
-        //   - PLS == U0 (0): USB 3.0 device, hardware completed link training, no PR needed
-        //   - PLS == Polling (7): USB 2.0 device on USB 3.0 port, must issue PR
-        //     (USB 2.0 devices cannot auto-train on USB 3.0 ports like USB 3.0 devices do)
-        // Note: speed field in PORTSC is only valid AFTER reset completes (PED=1)
-        //       Before PR, the speed field for a USB 2.0 device on USB 3.0 port is unreliable
+        // Skip explicit PR and just wait for the port to reach U0.
 
-        u32 current_pls = (portsc >> XHCI_PORTSC_PLS_SHIFT) & XHCI_PORTSC_PLS_MASK;
-        fprintf(stdout, "[ENUM]   Port %d: PLS=%u, judging reset type...\n", port, current_pls);
-
-        if (current_pls == 0) {
-            // USB 3.0 device already in U0: no PR needed
-            fprintf(stdout, "[ENUM]   Port %d: USB 3.0 device in U0, no PR needed\n", port);
-        } else if (current_pls == 7) {
-            // USB 2.0 device in Polling: need PR
-            fprintf(stdout, "[ENUM]   Port %d: USB 2.0 device in Polling, sending PR...\n", port);
-            // Write PR bit (bit 4) to PORTSC
-            xhci_port_write(handle, port, portsc | XHCI_PORTSC_PR);
-
-            // Wait for PR to complete: PED==1 indicates reset done
-            fprintf(stdout, "[ENUM]   Port %d: waiting for PR to complete (PED=1)...\n", port);
-            int pr_ok = 0;
-            for (int retries = 0; retries < 100; retries++) {
-                portsc = xhci_port_read(handle, port);
-                if (!(portsc & XHCI_PORTSC_CCS)) {
-                    fprintf(stdout, "[ENUM]   Port %d: device disconnected during PR\n", port);
-                    break;
-                }
-                if (portsc & XHCI_PORTSC_PED) {
-                    pr_ok = 1;
-                    break;
-                }
-                msleep(100);
-            }
-
-            if (!pr_ok) {
-                portsc = xhci_port_read(handle, port);
-                u32 pls = (portsc >> XHCI_PORTSC_PLS_SHIFT) & XHCI_PORTSC_PLS_MASK;
-                fprintf(stdout, "[ENUM]   Port %d: PR failed, PED=%u CCS=%u PLS=%u\n",
-                        port, (portsc >> 1) & 1, !!(portsc & XHCI_PORTSC_CCS), pls);
-                fprintf(stdout, "    device reset failed\n");
-                continue;
-            }
-
-            // PR complete, re-read final state (speed now valid)
+        // Wait for port to be in U0 (PLS=0) before attempting enumeration
+        fprintf(stdout, "[ENUM]   Port %d: waiting for U0 (no PR)...\n", port);
+        // xHCI spec: device must be in U0 for control transfers to work
+        fprintf(stdout, "[ENUM]   Port %d: waiting for U0...\n", port);
+        for (int retries = 0; retries < 100; retries++) {
             portsc = xhci_port_read(handle, port);
-            u32 new_pls = (portsc >> XHCI_PORTSC_PLS_SHIFT) & XHCI_PORTSC_PLS_MASK;
-            speed = (portsc >> XHCI_PORTSC_SPEED_SHIFT) & XHCI_PORTSC_SPEED_MASK;
-            fprintf(stdout, "[ENUM]   Port %d PR complete: PORTSC=0x%08x CCS=%u PED=%u PLS=%u SPD=%u\n",
-                    port, portsc, !!(portsc & XHCI_PORTSC_CCS),
-                    (portsc >> 1) & 1, new_pls, speed);
-        } else {
-            fprintf(stdout, "[ENUM]   Port %d: unexpected PLS=%u, skipping\n", port, current_pls);
-            fprintf(stdout, "    unexpected port state\n");
-            continue;
+            u32 pls = (portsc >> XHCI_PORTSC_PLS_SHIFT) & XHCI_PORTSC_PLS_MASK;
+                if (pls == 0)  // U0
+                    break;
+            msleep(100);
         }
-
-        // At this point, device is ready for enumeration
-        // PED should be set, speed should be valid
+        portsc = xhci_port_read(handle, port);
+        u32 pls_after = (portsc >> XHCI_PORTSC_PLS_SHIFT) & XHCI_PORTSC_PLS_MASK;
+        fprintf(stdout, "[ENUM]   Port %d after PR: PORTSC=0x%08x CCS=%u PED=%u PLS=%u SPD=%u\n",
+                port, portsc, !!(portsc & XHCI_PORTSC_CCS),
+                (portsc >> 1) & 1, pls_after,
+                (portsc >> XHCI_PORTSC_SPEED_SHIFT) & XHCI_PORTSC_SPEED_MASK);
         if (!(portsc & XHCI_PORTSC_CCS)) {
-            fprintf(stdout, "[ENUM]   Port %d: device disconnected after reset\n", port);
+            fprintf(stdout, "[ENUM]   Port %d: device disconnected after PR\n", port);
             fprintf(stdout, "    device disconnected after reset\n");
             continue;
         }
-        if (!(portsc & XHCI_PORTSC_PED)) {
-            fprintf(stdout, "[ENUM]   Port %d: PED=0 after reset, skipping\n", port);
-            fprintf(stdout, "    PED not set after reset\n");
+        if (!((portsc >> 1) & 1)) {
+            fprintf(stdout, "[ENUM]   Port %d: PED=0 after PR, skipping\n", port);
+            continue;
+        }
+        speed = (portsc >> XHCI_PORTSC_SPEED_SHIFT) & XHCI_PORTSC_SPEED_MASK;
+        fprintf(stdout, "[ENUM]   Port %d settled: PLS=%u SPD=%u\n", port, pls_after, speed);
+        if (pls_after != 0) {
+            fprintf(stdout, "[ENUM]   Port %d: not in U0 (PLS=%u), skipping\n", port, pls_after);
             continue;
         }
 
