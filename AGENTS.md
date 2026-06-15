@@ -107,3 +107,33 @@ sshpass -p 'hygon123' ssh root@10.65.46.174 "tail -f /var/log/app.log"
 - 不要将密码、token 等敏感信息硬编码到代码中
 - 不要修改与需求无关的文件
 - When in doubt, ask.
+
+## 📦 Git 版本管理
+
+### 远程仓库
+```
+平台: GitHub
+账号: woaike
+仓库: https://github.com/woaike/xhci_vfio
+SSH: git@github.com:woaike/xhci_vfio.git
+密钥: ~/.ssh/id_ed25519_gitee
+```
+
+### 提交规则
+- 每次对 `xhci-test/` 有**重大更新或突破性进展**时，必须提交到远程仓库
+- 提交信息格式：`git commit -m "核心改动描述"`
+- 描述要简洁明确，概括这次改动的关键内容
+- 示例：`git commit -m "enum_pass"` / `git commit -m "fix DMA transfer timeout"`
+
+### 提交流程
+```bash
+cd /home/hygon/.openclaw/agents/coder-agent
+git add xhci-test/
+git commit -m "描述你的核心改动"
+git push origin master
+```
+
+### 注意事项
+- 只提交有意义的改动，修改一行空格不要单独提交
+- 提交前确认代码能通过基本编译/测试
+- 不要提交编译产物（.o, .so 等已在 .gitignore 中）
